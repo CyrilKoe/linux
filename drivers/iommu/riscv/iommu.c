@@ -198,8 +198,11 @@ static irqreturn_t riscv_iommu_queue_ipsr(int irq, void *data)
 {
 	struct riscv_iommu_queue *queue = (struct riscv_iommu_queue *)data;
 
-	if (riscv_iommu_readl(queue->iommu, RISCV_IOMMU_REG_IPSR) & Q_IPSR(queue))
+	if (riscv_iommu_readl(queue->iommu, RISCV_IOMMU_REG_IPSR) & Q_IPSR(queue)) {
+		/* Clear fault interrupt pending and process in thread. */
+		riscv_iommu_writel(queue->iommu, RISCV_IOMMU_REG_IPSR, Q_IPSR(queue));
 		return IRQ_WAKE_THREAD;
+	}
 
 	return IRQ_NONE;
 }
@@ -223,6 +226,9 @@ static int riscv_iommu_queue_enable(struct riscv_iommu_device *iommu,
 	const unsigned int irq = iommu->irqs[riscv_iommu_queue_vec(iommu, queue->qid)];
 	u32 csr;
 	int rc;
+	// Debug print
+	struct irq_desc *desc = irq_data_to_desc(irq_get_irq_data(irq));
+	int hw_irq = desc->irq_data.hwirq;
 
 	if (queue->iommu)
 		return -EBUSY;
@@ -230,6 +236,8 @@ static int riscv_iommu_queue_enable(struct riscv_iommu_device *iommu,
 	/* Polling not implemented */
 	if (!irq)
 		return -ENODEV;
+
+	pr_info("Enable irq %u (hw: %u) for queue %u (bit: %u)\n\r", irq, hw_irq, queue->qid, Q_IPSR(queue));
 
 	queue->iommu = iommu;
 	rc = request_threaded_irq(irq, riscv_iommu_queue_ipsr, irq_handler,
@@ -488,22 +496,13 @@ static void riscv_iommu_cmd_sync(struct riscv_iommu_device *iommu,
 			     "Hardware error: command execution timeout\n");
 }
 
+
 /*
  * IOMMU Fault/Event queue chapter 3.2
  */
 
 static void riscv_iommu_fault(struct riscv_iommu_device *iommu,
-			      struct riscv_iommu_fq_record *event)
-{
-	unsigned int err = FIELD_GET(RISCV_IOMMU_FQ_HDR_CAUSE, event->hdr);
-	unsigned int devid = FIELD_GET(RISCV_IOMMU_FQ_HDR_DID, event->hdr);
-
-	/* Placeholder for future fault handling implementation, report only. */
-	if (err)
-		dev_warn_ratelimited(iommu->dev,
-				     "Fault %d devid: 0x%x iotval: %llx iotval2: %llx\n",
-				     err, devid, event->iotval, event->iotval2);
-}
+			      struct riscv_iommu_fq_record *event);
 
 /* Fault queue interrupt handler thread function */
 static irqreturn_t riscv_iommu_fltq_process(int irq, void *data)
@@ -515,9 +514,6 @@ static irqreturn_t riscv_iommu_fltq_process(int irq, void *data)
 	int cnt, len;
 
 	events = (struct riscv_iommu_fq_record *)queue->base;
-
-	/* Clear fault interrupt pending and process all received fault events. */
-	riscv_iommu_writel(iommu, RISCV_IOMMU_REG_IPSR, Q_IPSR(queue));
 
 	do {
 		cnt = riscv_iommu_queue_consume(queue, &idx);
@@ -686,6 +682,8 @@ static int riscv_iommu_iodir_alloc(struct riscv_iommu_device *iommu)
 
 	if (!iommu->ddt_root)
 		return -ENOMEM;
+
+	pr_info("Allocated DDT mode %u at %p (%llx)\n", mode, iommu->ddt_root, iommu->ddt_phys);
 
 	return 0;
 }
@@ -1142,6 +1140,7 @@ pte_retry:
 				iommu_free_page(addr);
 				goto pte_retry;
 			}
+			pr_info_ratelimited("Allocated pte at %llx (= %llx)\n", virt_to_phys(ptr), pte);
 		}
 		ptr = (unsigned long *)pfn_to_virt(__page_val_to_pfn(pte));
 	} while (level-- > 0);
@@ -1186,12 +1185,14 @@ static int riscv_iommu_map_pages(struct iommu_domain *iommu_domain,
 	int rc = 0;
 	LIST_HEAD(freelist);
 
+	pr_info("Mapping iova=%llx phys=%llx pgsize=%llx pgcount=%x\n", iova, phys, pgsize, pgcount);
+
 	if (!(prot & IOMMU_WRITE))
-		pte_prot = _PAGE_BASE | _PAGE_READ;
+		pte_prot = _PAGE_BASE | _PAGE_READ | _PAGE_ACCESSED;
 	else if (domain->amo_enabled)
 		pte_prot = _PAGE_BASE | _PAGE_READ | _PAGE_WRITE;
 	else
-		pte_prot = _PAGE_BASE | _PAGE_READ | _PAGE_WRITE | _PAGE_DIRTY;
+		pte_prot = _PAGE_BASE | _PAGE_READ | _PAGE_WRITE | _PAGE_DIRTY | _PAGE_ACCESSED;
 
 	while (pgcount) {
 		ptr = riscv_iommu_pte_alloc(domain, iova, page_size, gfp);
@@ -1202,6 +1203,7 @@ static int riscv_iommu_map_pages(struct iommu_domain *iommu_domain,
 
 		old = READ_ONCE(*ptr);
 		pte = _io_pte_entry(phys_to_pfn(phys), pte_prot);
+		pr_info_ratelimited("Set pte at %llx to %llx", phys, _io_pte_entry(phys_to_pfn(phys), pte_prot));
 		if (cmpxchg_relaxed(ptr, old, pte) != old)
 			continue;
 
@@ -1314,6 +1316,8 @@ static int riscv_iommu_attach_paging_domain(struct iommu_domain *iommu_domain,
 	struct riscv_iommu_device *iommu = dev_to_iommu(dev);
 	struct riscv_iommu_info *info = dev_iommu_priv_get(dev);
 	u64 fsc, ta;
+
+	pr_info("Attach paging domain %s\n", dev->kobj.name);
 
 	if (!riscv_iommu_pt_supported(iommu, domain->pgd_mode))
 		return -ENODEV;
@@ -1476,9 +1480,31 @@ static struct iommu_group *riscv_iommu_device_group(struct device *dev)
 	return generic_device_group(dev);
 }
 
+static bool riscv_iommu_capable(struct device *dev, enum iommu_cap cap)
+{
+        //not 100% accurate but added to make iommufd work
+        switch (cap) {
+        case IOMMU_CAP_CACHE_COHERENCY:
+                return true;
+        case IOMMU_CAP_NOEXEC:
+                return false;
+        case IOMMU_CAP_ENFORCE_CACHE_COHERENCY:
+                return true;
+        case IOMMU_CAP_DEFERRED_FLUSH:
+                return true;
+        default:
+                break;
+        }
+
+        return false;
+}
+
 static int riscv_iommu_of_xlate(struct device *dev, const struct of_phandle_args *args)
 {
-	return iommu_fwspec_add_ids(dev, args->args, 1);
+    struct of_phandle_args a = *args;
+    if (args->args_count == 0)
+		a.args[0] = 0;
+    return iommu_fwspec_add_ids(dev, a.args, 1);
 }
 
 static struct iommu_device *riscv_iommu_probe_device(struct device *dev)
@@ -1539,6 +1565,7 @@ static void riscv_iommu_release_device(struct device *dev)
 }
 
 static const struct iommu_ops riscv_iommu_ops = {
+	.capable  = riscv_iommu_capable,
 	.pgsize_bitmap = SZ_4K,
 	.of_xlate = riscv_iommu_of_xlate,
 	.identity_domain = &riscv_iommu_identity_domain,
@@ -1638,7 +1665,7 @@ int riscv_iommu_init(struct riscv_iommu_device *iommu)
 
 	rc = riscv_iommu_queue_enable(iommu, &iommu->cmdq, riscv_iommu_cmdq_process);
 	if (rc)
-		return rc;
+		goto err_queue_disable;
 
 	rc = riscv_iommu_queue_enable(iommu, &iommu->fltq, riscv_iommu_fltq_process);
 	if (rc)
@@ -1671,4 +1698,40 @@ err_queue_disable:
 	riscv_iommu_queue_disable(&iommu->fltq);
 	riscv_iommu_queue_disable(&iommu->cmdq);
 	return rc;
+}
+
+static void riscv_iommu_fault(struct riscv_iommu_device *iommu,
+			      struct riscv_iommu_fq_record *event)
+{
+	unsigned int err = FIELD_GET(RISCV_IOMMU_FQ_HDR_CAUSE, event->hdr);
+	unsigned int devid = FIELD_GET(RISCV_IOMMU_FQ_HDR_DID, event->hdr);
+	struct riscv_iommu_dc *dc;
+	struct iopf_fault fault_evt = { };
+	struct iommu_fault *flt = &fault_evt.fault;
+	// Necessary infos to walk the PTE
+	struct riscv_iommu_info *info = dev_iommu_priv_get(iommu->dev);
+	struct riscv_iommu_domain *domain;
+	unsigned long pte_size;
+	unsigned long *ptr;
+	struct iommu_fwspec *fwspec = dev_iommu_fwspec_get(iommu->dev);
+
+	/* Placeholder for future fault handling implementation, report only. */
+	if (err)
+		dev_warn_ratelimited(iommu->dev,
+				     "Fault %d devid: 0x%x iotval: %llx iotval2: %llx\n",
+				     err, devid, event->iotval, event->iotval2);
+
+	switch (err) {
+	case RISCV_IOMMU_FQ_CAUSE_RD_FAULT_S:
+		break;
+	default:
+		return;
+	}
+
+	if(info) {
+		domain = info->domain;
+	}
+	// Do we want to walk to pte here ?
+	ptr = riscv_iommu_pte_fetch(domain, event->iotval, &pte_size);
+	dc = riscv_iommu_get_dc(iommu, devid);
 }
